@@ -15,6 +15,7 @@ dasha_test_out.txt
 
 # Patient data (sensitive)
 patients/
+charts_cache/
 chart_data.json
 raw_chart.json
 raw_dasha.json

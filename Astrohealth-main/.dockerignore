@@ -17,7 +17,12 @@ gitleaks.toml
 # --- Documentation ---
 *.md
 
-# --- CRITICAL: Local Database Storage ---
-# Prevents Docker from copying running data volumes into the image
+# Local data and tests are not part of the runtime image
 postgres_data/
 qdrant_data/
+patients/
+charts_cache/
+astrohealth-app-main/tests/
+**/.env
+**/.env.*
+!**/.env.example
