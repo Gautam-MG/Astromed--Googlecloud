@@ -1,0 +1,91 @@
+services:
+  # =======================================================================
+  # 1. THE FLASK APPLICATION CORE (Your backend server logic)
+  # =======================================================================
+  backend:
+    # Builds the application container image using the Dockerfile in the current directory
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # Maps internal port 8000 to external port 8000 so iOS/Android apps can send requests
+    ports:
+      - "8000:8000"
+    # Automatically extracts Google Gemini and environment variables from your local hidden .env file
+    env_file:
+      - .env
+    # Passes internal address links directly into your Python scripts at runtime
+    environment:
+      - DATABASE_URL=postgres://astro_admin:secure_astro_pass@db:5432/astro_health_prod
+      - REDIS_URL=redis://redis:6379
+      - QDRANT_HOST=vector_db
+      - QDRANT_PORT=6333
+    # CRITICAL: Forces Python to wait in a pause state until your databases finish waking up
+    depends_on:
+      db:
+        condition: service_healthy    # Backend waits until Postgres is validated as healthy
+      redis:
+        condition: service_started    # Backend waits until Redis runtime loop activates
+      vector_db:
+        condition: service_started    # FIXED: Backend boots immediately once Qdrant process starts, avoiding health check lockups!
+
+  # =======================================================================
+  # 2. RELATIONAL DATABASE (Stores permanent mobile user profile data)
+  # =======================================================================
+  db:
+    # Uses a highly optimized, compact version of PostgreSQL 16
+    image: postgres:16-alpine
+    # Creates the initial internal root parameters and database name upon deployment
+    environment:
+      - POSTGRES_USER=astro_admin
+      - POSTGRES_PASSWORD=secure_astro_pass
+      - POSTGRES_DB=astro_health_prod
+    # Maps port 5432 locally so you can connect inspection software (like DBeaver or pgAdmin)
+    ports:
+      - "5432:5432"
+    # Mounts an anchor on your host PC drive so user metrics aren't wiped out when containers restart
+    volumes:
+      - postgres_data:/var/lib/postgresql/data # CRITICAL: Keeps user accounts safe when container stops
+    # Periodic script that tests whether the database engine is fully ready to take inputs
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U astro_admin -d astro_health_prod"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # =======================================================================
+  # 3. REDIS ENGINE (Caches temporary render calculations and chart data)
+  # =======================================================================
+  redis:
+    # Uses a fast, lightweight Alpine footprint image of Redis 7
+    image: redis:7-alpine
+    # Maps port 6379 so you can track cache keys or handle background tasks locally
+    ports:
+      - "6379:6379"
+    # Persists your data dump engine metrics securely on your hardware storage
+    volumes:
+      - redis_data:/data # Keeps your cache configurations persistent
+
+  # =======================================================================
+  # 4. RAG KNOWLEDGE BASE (Stores your reference texts and text embeddings)
+  # =======================================================================
+  vector_db:
+    # Uses the latest official Rust-powered Qdrant vector database engine
+    image: qdrant/qdrant:latest
+    # Maps port 6333 so you can use the interactive dashboard on your web browser
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    # Holds your custom astrological textbook context vectors safely on your PC disk
+    volumes:
+      - qdrant_data:/qdrant/storage
+    # NOTE: The custom healthcheck has been dropped from this section.
+    # Distroless minimalist containers do not support shell evaluation utilities out of the box,
+    # and dropping this allows your engine to scale cleanly without local pipeline interference.
+
+# =======================================================================
+# PERSISTENT STORAGE ANCHORS (Keeps your data alive on your host machine)
+# =======================================================================
+volumes:
+  postgres_data:   # Keeps user health logs and birth entries permanent
+  redis_data:      # Keeps structural cache layouts persistent 
+  qdrant_data:     # Keeps custom astrology RAG text files and math embeddings safe

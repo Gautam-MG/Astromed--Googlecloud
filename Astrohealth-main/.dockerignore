@@ -1,0 +1,23 @@
+# --- Python Artifacts ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv
+env/
+
+# --- Version Control & Actions ---
+.git
+.github
+
+# --- Security & Credentials ---
+.env
+gitleaks.toml
+
+# --- Documentation ---
+*.md
+
+# --- CRITICAL: Local Database Storage ---
+# Prevents Docker from copying running data volumes into the image
+postgres_data/
+qdrant_data/
