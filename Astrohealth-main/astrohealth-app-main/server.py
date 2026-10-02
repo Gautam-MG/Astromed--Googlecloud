@@ -6,7 +6,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
 from flask import (Flask, request,
-                   jsonify, send_from_directory)
+                   jsonify, send_from_directory, g)
 from flask_cors import CORS
 from timezonefinder import TimezoneFinder
 from datetime import datetime
@@ -18,23 +18,22 @@ import json as _json
 
 import os
 
-from flask_basicauth import BasicAuth
+from werkzeug.exceptions import HTTPException
+from app_core.errors import AuthorizationError, RequestValidationError, UpstreamError
+from app_core.http import enforce_patient_access, register_http, require_auth, safe_failure
+from app_core.logging_config import log
+from app_core.prokerala_token import get_prokerala_token
+from app_core.runtime import get_services
+from app_core.validation import parse_chart_input, parse_chat_message, require_session_id
 
 app = Flask(__name__)
-CORS(app)
-AUTH_USER = os.environ.get("AUTH_USER")
-AUTH_PASS = os.environ.get("AUTH_PASS")
-
-if not AUTH_USER or not AUTH_PASS:
-    raise RuntimeError(
-        "AUTH_USER and AUTH_PASS environment variables must be configured"
-    )
-
-app.config["BASIC_AUTH_USERNAME"] = AUTH_USER
-app.config["BASIC_AUTH_PASSWORD"] = AUTH_PASS
-app.config["BASIC_AUTH_FORCE"] = False
-
-basic_auth = BasicAuth(app)
+_settings = get_services().settings
+CORS(
+    app,
+    resources={r"/*": {"origins": _settings.allowed_origins}},
+    supports_credentials=False,
+)
+register_http(app)
     
 from rules import (
     apply_rule_1,
@@ -104,39 +103,8 @@ conversation_store = {}
 
 # Credentials now imported from config.py
 
-# ── Token cache (auto-refreshes before expiry) ─────────────────────────────
-_cached_token     = None
-_token_expires_at = None
-
-
 async def get_token() -> str:
-    global _cached_token, _token_expires_at
-
-    if _cached_token and time.time() < _token_expires_at:
-        return _cached_token
-
-    async with httpx.AsyncClient() as client:
-        r = await client.post(
-            "https://api.prokerala.com/token",
-            data={
-                "grant_type":    "client_credentials",
-                "client_id":     PROKERALA_CLIENT_ID,
-                "client_secret": PROKERALA_CLIENT_SECRET,
-            }
-        )
-
-    if r.status_code != 200:
-        if r.status_code == 401:
-            raise Exception(f"❌ Prokerala Auth failed: 401 (Unauthorized). "
-                            f"Please check your PROKERALA_CLIENT_ID and PROKERALA_CLIENT_SECRET in config.py. "
-                            f"Original error: {r.text}")
-        raise Exception(f"Auth failed: {r.status_code} — {r.text}")
-
-    d = r.json()
-    _cached_token     = d["access_token"]
-    _token_expires_at = time.time() + d["expires_in"] - 300  # refresh 5 min early
-    print("✅ Token fetched")
-    return _cached_token
+    return await get_prokerala_token(PROKERALA_CLIENT_ID, PROKERALA_CLIENT_SECRET)
 
 
 def get_timezone_offset(lat: float, lng: float) -> str:
@@ -927,30 +895,25 @@ def _build_latest_patient_payload(patient_id: str) -> dict:
 # POST /generate-chart
 # ══════════════════════════════════════════════════════════════
 @app.route("/generate-chart", methods=["POST"])
-@basic_auth.required
+@require_auth(rate_limit="chart")
 def generate_chart():
     try:
         body = request.get_json(force=True)
+        chart_input = parse_chart_input(body)
+        name = chart_input["name"]
+        dob = chart_input["dob"]
+        birth_time = chart_input["birth_time"]
+        lat = chart_input["lat"]
+        lng = chart_input["lng"]
+        birth_place = chart_input["birth_place"]
+        father_name = chart_input["father_name"]
+        mother_name = chart_input["mother_name"]
+        gender = chart_input["gender"]
 
-        name        = body.get("name", "").strip()
-        dob         = body.get("dob", "")          # "YYYY-MM-DD"
-        birth_time  = body.get("birth_time", "08:00")  # "HH:MM"
-        lat         = float(body.get("lat", 0))
-        lng         = float(body.get("lng", 0))
-        birth_place = body.get("birth_place", "")
-        father_name = body.get("father_name", "")
-        mother_name = body.get("mother_name", "")
-        gender      = body.get("gender", "Unknown")
-
-        if not name or not dob or not lat or not lng:
-            return jsonify({"success": False, "error": "name, dob, lat, lng are required"}), 400
-
-        print(f"\n{'='*50}")
-        print(f"  Patient     : {name}")
-        print(f"  DOB         : {dob}  Time: {birth_time}")
-        print(f"  Birth Place : {birth_place}")
-        print(f"  Lat / Lng   : {lat}, {lng}")
-        print(f"{'='*50}")
+        log.info(
+            "chart_requested",
+            extra={"request_id": getattr(g, "request_id", ""), "internal_user_id": g.user["internal_user_id"], "operation": "generate_chart"},
+        )
 
         # Step 1: Fetch and save raw data
         fetch_result = asyncio.run(fetch_and_save(
@@ -962,7 +925,8 @@ def generate_chart():
             place      = birth_place,
             gender     = gender,
             father_name = father_name,
-            mother_name = mother_name
+            mother_name = mother_name,
+            owner_id   = g.user["internal_user_id"],
         ))
 
         patient_id = fetch_result["patient_id"]
@@ -1061,7 +1025,7 @@ def generate_chart():
                 planet_diseases[p["name"]] = filter_terms_by_gender(diseases, gender)
 
         # Step 4: Build response exactly as before
-        return jsonify({
+        payload = {
             "success":           True,
             "name":              name,
             "dob":               dob,
@@ -1100,13 +1064,22 @@ def generate_chart():
             "birth_current_distance": birth_current_distance,
             "health_forecast":   processed.get("health_forecast", []),
             "data_source":       source,
-        })
+        }
+        lineage = get_services().persistence.save_generation(
+            g.user["internal_user_id"],
+            chart_input,
+            patient_id,
+            source,
+            payload,
+        )
+        payload["input_id"] = lineage["input_id"]
+        return jsonify(payload)
 
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        print(f"[Error] Error: {e}")
-        return jsonify({"success": False, "error": str(e)}), 500
+    except (RequestValidationError, UpstreamError, AuthorizationError, HTTPException):
+        raise
+    except Exception:
+        log.error("chart_failed", extra={"request_id": getattr(g, "request_id", ""), "operation": "generate_chart"})
+        return safe_failure()
 
 
 
@@ -1121,20 +1094,43 @@ def health():
 
 
 
+@app.get("/ready")
+def ready():
+    ok, checks = get_services().ready()
+    return jsonify({"status": "ready" if ok else "not_ready", "checks": checks}), (200 if ok else 503)
+
+
+@app.get("/public-config")
+def public_config():
+    settings = get_services().settings
+    return jsonify({
+        "clerkPublishableKey": settings.clerk_publishable_key,
+        "frontendUrl": settings.frontend_url,
+    })
+
+
+@app.get("/me/records")
+@require_auth(rate_limit="read")
+def my_records():
+    records = get_services().repository.list_records(g.user["internal_user_id"])
+    return jsonify({"success": True, "records": records})
+
+
 @app.get("/patient-data/<patient_id>")
-@basic_auth.required
+@require_auth(rate_limit="read")
 def patient_data(patient_id):
     try:
+        enforce_patient_access(patient_id)
         payload = _build_latest_patient_payload(patient_id)
         if not payload:
-            return jsonify({"success": False, "error": "patient data not found"}), 404
+            return jsonify({"success": False, "error": "Not found."}), 404
         return jsonify({"success": True, "patient_id": patient_id, "data": payload})
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+    except Exception:
+        raise
 
 
 @app.get("/priority6-data/<patient_id>")
-@basic_auth.required
+@require_auth(rate_limit="read")
 def priority6_data(patient_id):
     """
     New priority-cascade page. Pulls ONLY the cached patient/chart facts
@@ -1144,9 +1140,10 @@ def priority6_data(patient_id):
     computed fresh, with no chart-specific overrides applied.
     """
     try:
+        enforce_patient_access(patient_id)
         payload = _build_latest_patient_payload(patient_id)
         if not payload:
-            return jsonify({"success": False, "error": "patient data not found"}), 404
+            return jsonify({"success": False, "error": "Not found."}), 404
 
         folder = os.path.join("patients", str(patient_id))
         cached_chart_data = _read_json_if_exists(os.path.join(folder, "chart_data.json")) or {}
@@ -1197,8 +1194,11 @@ def priority6_data(patient_id):
             "shadbala_weighted_priority": shadbala_weighted_priority,
             "dasha_weighted_priority": dasha_weighted_priority,
         })
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+    except (RequestValidationError, AuthorizationError, HTTPException):
+        raise
+    except Exception:
+        log.error("priority6_failed", extra={"request_id": getattr(g, "request_id", ""), "operation": "priority6"})
+        return safe_failure()
 
 
 async def call_gemini(
@@ -1281,13 +1281,11 @@ async def call_gemini(
             )
             
         if r.status_code in [401, 403]:
-            raise Exception(f"[Error] Gemini API Auth failed: {r.status_code}. "
-                            f"Please check your GEMINI_API_KEY in config.py. "
-                            f"Original error: {r.text}")
+            log.error("gemini_auth_failed", extra={"operation": "gemini", "status": r.status_code})
+            raise UpstreamError("gemini")
 
-        print(f"Gemini error: {r.status_code}")
-        print(f"Response: {r.text[:300]}")
-        raise Exception(f"Gemini API Error: {r.status_code} — {r.text}")
+        log.error("gemini_failed", extra={"operation": "gemini", "status": r.status_code})
+        raise UpstreamError("gemini")
 
     data = r.json()
     
@@ -1321,7 +1319,7 @@ async def call_gemini(
     return response.strip()
 
 @app.route("/start-consultation", methods=["POST"])
-@basic_auth.required
+@require_auth(rate_limit="chat")
 def start_consultation():
     """
     Starts a new AI health consultation.
@@ -1330,15 +1328,15 @@ def start_consultation():
     try:
         body = request.get_json(force=True)
 
-        session_id = body.get("session_id", "")
+        session_id = require_session_id(body.get("session_id", ""))
         patient_id = body.get("patient_id", "")
+        enforce_patient_access(patient_id)
+        get_services().session_owners[session_id] = {
+            "internal_user_id": g.user["internal_user_id"],
+            "patient_id": patient_id,
+        }
 
-        if not session_id:
-            return jsonify({"success": False, "error": "session_id required"}), 400
-        if not patient_id:
-            return jsonify({"success": False, "error": "patient_id required"}), 400
-
-        print(f"\n[AI] Starting consultation: {session_id} | patient: {patient_id}")
+        log.info("consultation_started", extra={"request_id": getattr(g, "request_id", ""), "operation": "start_consultation"})
 
         opening_result = chat_start(
             session_id,
@@ -1347,6 +1345,9 @@ def start_consultation():
             call_gemini
         )
 
+        get_services().persistence.save_chat_turn(
+            g.user["internal_user_id"], session_id, patient_id, "assistant", opening_result["response"], 1
+        )
         return jsonify({
             "success":  True,
             "response": opening_result["response"],
@@ -1355,14 +1356,14 @@ def start_consultation():
             "chat_debug": opening_result.get("debug_context", {})
         })
 
-    except Exception as e:
-        import traceback
-        print(f"❌ Start consultation error:")
-        print(traceback.format_exc())
-        return jsonify({"success": False, "error": str(e)}), 500
+    except (RequestValidationError, AuthorizationError, UpstreamError, HTTPException):
+        raise
+    except Exception:
+        log.error("consultation_failed", extra={"request_id": getattr(g, "request_id", ""), "operation": "start_consultation"})
+        return safe_failure()
 
 @app.route("/send-message", methods=["POST"])
-@basic_auth.required
+@require_auth(rate_limit="chat")
 def send_message():
     """
     Handles each patient message via chat_module.
@@ -1370,16 +1371,15 @@ def send_message():
     try:
         body = request.get_json(force=True)
 
-        session_id   = body.get("session_id", "")
-        user_message = body.get("message", "").strip()
-
-        if not session_id:
-            return jsonify({"success": False, "error": "session_id required"}), 400
+        session_id = require_session_id(body.get("session_id", ""))
+        user_message = parse_chat_message(body.get("message", ""))
+        owner = get_services().session_owners.get(session_id)
+        if not owner or owner["internal_user_id"] != g.user["internal_user_id"]:
+            return jsonify({"success": False, "error": "Not found."}), 404
+        enforce_patient_access(owner["patient_id"])
 
         if session_id not in conversation_store:
             return jsonify({"success": False, "error": "Session not found."}), 400
-
-        print(f"\n💬 Turn {conversation_store[session_id]['turn_count']+1} — User: {user_message[:50]}...")
 
         result = chat_send_message(
             session_id,
@@ -1398,6 +1398,14 @@ def send_message():
                     del conversation_store[session_id]
             threading.Thread(target=cleanup, daemon=True).start()
 
+        get_services().persistence.save_chat_turn(
+            g.user["internal_user_id"],
+            session_id,
+            owner["patient_id"],
+            "user",
+            user_message,
+            result["turn"],
+        )
         return jsonify({
             "success":  True,
             "response": result["response"],
@@ -1406,16 +1414,16 @@ def send_message():
             "chat_debug": result.get("debug_context", {})
         })
 
-    except Exception as e:
-        import traceback
-        print(f"❌ Send message error:")
-        print(traceback.format_exc())
-        return jsonify({"success": False, "error": str(e)}), 500
+    except (RequestValidationError, AuthorizationError, UpstreamError, HTTPException):
+        raise
+    except Exception:
+        log.error("message_failed", extra={"request_id": getattr(g, "request_id", ""), "operation": "send_message"})
+        return safe_failure()
 
 
 
 @app.route("/combine-output", methods=["POST"])
-@basic_auth.required
+@require_auth(rate_limit="chart")
 def combine_output():
     """
     Module C aggregation endpoint.
@@ -1424,9 +1432,7 @@ def combine_output():
     try:
         body = request.get_json(force=True)
         patient_id = body.get("patient_id")
-
-        if not patient_id:
-            return jsonify({"success": False, "error": "patient_id required"}), 400
+        enforce_patient_access(patient_id)
 
         # Verify chat log exists
         log_file = f"patients/{patient_id}/chat_log.json"
@@ -1445,20 +1451,21 @@ def combine_output():
                 "error": "Aggregation engine failed to produce output."
             }), 500
 
+        get_services().persistence.save_combined_module(g.user["internal_user_id"], patient_id, result)
         return jsonify({
             "success": True,
             "final_output": result
         })
 
-    except Exception as e:
-        import traceback
-        print(f"❌ Aggregation error:")
-        print(traceback.format_exc())
-        return jsonify({"success": False, "error": str(e)}), 500
+    except (RequestValidationError, AuthorizationError, HTTPException):
+        raise
+    except Exception:
+        log.error("combine_failed", extra={"request_id": getattr(g, "request_id", ""), "operation": "combine_output"})
+        return safe_failure()
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
+    port = int(os.environ.get("PORT", 8000))
 
     print(f"[START] Binding to 0.0.0.0:{port}")
 

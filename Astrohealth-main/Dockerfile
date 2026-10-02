@@ -1,26 +1,24 @@
-# =======================================================================
-# STAGE 1: The Build Environment (Heavy Lift Compiler Stage)
-# =======================================================================
-FROM python:3.11-slim AS builder
+FROM python:3.11.13-slim-bookworm
+
+RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin appuser
 WORKDIR /app
-RUN pip install --no-cache-dir --upgrade pip
-COPY astrohealth-app-main/requirements.txt .
-RUN pip install --no-cache-dir --user -r requirements.txt
 
-# =======================================================================
-# STAGE 2: The Lean Runtime Environment (Production Delivery Stage)
-# =======================================================================
-FROM python:3.11-slim
-WORKDIR /app
-COPY --from=builder /root/.local /root/.local
-COPY . .
+COPY astrohealth-app-main/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt \
+    && rm /tmp/requirements.txt
 
-ENV PATH=/root/.local/bin:$PATH
-ENV PYTHONUNBUFFERED=1
+COPY astrohealth-app-main/ /app/
+RUN mkdir -p /app/patients /app/charts_cache \
+    && chown -R appuser:appuser /app
 
-# Step inside the inner folder room where server.py lives
-WORKDIR /app/astrohealth-app-main
-EXPOSE 5000
+USER appuser
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PORT=8000 \
+    HOME=/tmp
 
-# Launch using the production Gunicorn engine
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "server:app"]
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"
+
+CMD ["gunicorn", "-c", "gunicorn.conf.py", "server:app"]

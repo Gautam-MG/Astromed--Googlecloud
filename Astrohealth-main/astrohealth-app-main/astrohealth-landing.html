@@ -3,6 +3,8 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<link rel="stylesheet" href="/static/responsive.css"/>
+<script src="/static/session.js" defer></script>
 <title>AstroMedica — Celestial Health Intelligence</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,600;1,300;1,400&family=Outfit:wght@300;400;500;600&display=swap" rel="stylesheet">
@@ -710,13 +712,15 @@
     <div class="logo-icon">✦</div>
     AstroMedica
   </a>
+  <button class="mobile-nav-toggle" type="button" aria-label="Open menu">Menu</button>
   <ul class="nav-links">
     <li><a href="#how">How It Works</a></li>
     <li><a href="#features">Features</a></li>
     <li><a href="#preview">Platform</a></li>
     <li><a href="#testimonials">Testimonials</a></li>
   </ul>
-  <div style="display: flex; align-items: center;">
+  <div style="display: flex; align-items: center; gap: 12px;">
+    <div id="account-slot"></div>
     <a href="#cta" class="nav-cta">Request Access</a>
     <button class="theme-toggle" id="theme-toggle" aria-label="Toggle Theme">
       <!-- Sun Icon (Lucide-like SVG) -->

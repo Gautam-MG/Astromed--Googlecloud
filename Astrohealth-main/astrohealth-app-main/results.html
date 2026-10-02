@@ -3,6 +3,8 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<link rel="stylesheet" href="/static/responsive.css"/>
+<script src="/static/session.js" defer></script>
 <title>AstroMedica — Your Birth Chart</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,600;1,300;1,400&family=Outfit:wght@300;400;500;600&display=swap" rel="stylesheet">
@@ -1420,7 +1422,8 @@
     <div class="logo-icon">✦</div>
     AstroMedica
   </a>
-  <div style="display: flex; gap: 12px; align-items: center;">
+  <div id="account-slot"></div>
+  <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
     <button id="btn-download" class="btn-back" style="cursor: pointer;">⬇ Download JSON</button>
     <a id="btn-priority6" href="/priority6" target="_blank" rel="noopener" class="btn-back">New Priority Engine</a>
     <a href="/" class="btn-back">New Analysis</a>

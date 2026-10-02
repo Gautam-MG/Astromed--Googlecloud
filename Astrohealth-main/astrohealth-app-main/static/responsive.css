@@ -1,0 +1,64 @@
+/* Shared responsive and focus rules. Visual identity stays with each page. */
+html, body {
+  max-width: 100%;
+  overflow-x: hidden;
+}
+img, svg, video, canvas, iframe {
+  max-width: 100%;
+  height: auto;
+}
+.analysis-table-wrap,
+.card,
+.content,
+.container,
+.birth-form,
+.patient-header {
+  max-width: 100%;
+}
+input, select, textarea, button {
+  max-width: 100%;
+}
+button, .nav-cta, .birth-submit, .btn-back, input, select {
+  min-height: 44px;
+}
+:focus-visible {
+  outline: 2px solid #C9A84C;
+  outline-offset: 2px;
+}
+.mobile-nav-toggle {
+  display: none;
+  min-width: 44px;
+  min-height: 44px;
+  border: 1px solid var(--border, rgba(201,168,76,0.3));
+  background: transparent;
+  color: var(--gold, #C9A84C);
+  border-radius: 8px;
+}
+#account-slot {
+  min-width: 44px;
+  min-height: 44px;
+}
+@media (max-width: 900px), (pointer: coarse) {
+  .cursor, .cursor-ring { display: none !important; }
+  body, a, button, input, select, textarea { cursor: auto !important; }
+  nav { flex-wrap: wrap; gap: 12px; }
+  .mobile-nav-toggle { display: inline-flex; align-items: center; justify-content: center; }
+  .nav-links {
+    display: none;
+    width: 100%;
+    flex-direction: column;
+    gap: 12px;
+    padding-top: 8px;
+  }
+  .nav-links.open { display: flex; }
+  .container, .content, footer, nav { padding-left: 16px !important; padding-right: 16px !important; }
+  .birth-form-row { grid-template-columns: 1fr !important; }
+  .houses-grid { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+  .info-pills, .patient-header, .chart-card { max-width: 100%; }
+}
+@media (max-width: 720px) {
+  h1, .patient-name, .cta-title, .hero-title { overflow-wrap: anywhere; }
+  table { display: block; width: 100%; overflow-x: auto; }
+  .analysis-table { min-width: 640px; }
+  footer { text-align: center; }
+}

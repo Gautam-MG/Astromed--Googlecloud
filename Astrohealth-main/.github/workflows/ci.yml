@@ -44,11 +44,15 @@ jobs:
           cache: 'pip' # Automatically caches standard pip packages to save compute minutes
 
       - name: Install Python Libraries
-        env:
-          PIP_EXTRA_INDEX_URL: https://pytorch.org
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          python -m pip install -r astrohealth-app-main/requirements-dev.txt
+
+      - name: Run tests
+        working-directory: astrohealth-app-main
+        env:
+          APP_ENV: test
+        run: python -m pytest -q
 
   # =======================================================================
   # JOB 3: Production Docker Build & Layer Verification

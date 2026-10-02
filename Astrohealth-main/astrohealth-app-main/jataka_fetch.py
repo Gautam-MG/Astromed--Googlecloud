@@ -20,13 +20,16 @@ from datetime import datetime
 import pytz
 
 from config import PROKERALA_CLIENT_ID, PROKERALA_CLIENT_SECRET
+from app_core.prokerala_token import get_prokerala_token, prokerala_get
 
-_cached_token     = None
-_token_expires_at = None
+import threading
+
+_patient_lock = threading.Lock()
+_birth_locks: dict[str, asyncio.Lock] = {}
 
 # ── Cache Logic ─────────────────────────────
-CACHE_DIR = "charts_cache"
-PATIENTS_DIR = "patients"
+CACHE_DIR = os.environ.get("CHART_CACHE_DIR", "charts_cache")
+PATIENTS_DIR = os.environ.get("PATIENT_DATA_DIR", "patients")
 PATIENT_INDEX_FILE = os.path.join(PATIENTS_DIR, "index.json")
 
 def get_request_key(name: str, dob: str, birth_time: str, lat: float, lng: float) -> str:
@@ -94,7 +97,17 @@ def _find_existing_patient(req_key: str) -> str | None:
     for entry in os.scandir(PATIENTS_DIR):
         if not entry.is_dir():
             continue
+        profile = _read_json(os.path.join(entry.path, "profile.json"), {})
         raw_chart = _read_json(os.path.join(entry.path, "raw_chart.json"), {})
+        stored_key = ""
+        if isinstance(profile, dict):
+            stored_key = profile.get("chart_key") or ""
+        if not stored_key and isinstance(raw_chart, dict):
+            stored_key = raw_chart.get("chart_key") or ""
+        if stored_key:
+            if stored_key == req_key:
+                matches.append(entry.name)
+            continue
         if not raw_chart:
             continue
         try:
@@ -116,25 +129,32 @@ def _find_existing_patient(req_key: str) -> str | None:
 
 
 def get_or_create_patient(req_key: str) -> tuple[str, str, bool]:
-    os.makedirs(PATIENTS_DIR, exist_ok=True)
-    index = _load_patient_index()
-    patient_id = index.get(req_key)
+    with _patient_lock:
+        os.makedirs(PATIENTS_DIR, exist_ok=True)
+        index = _load_patient_index()
+        patient_id = index.get(req_key)
 
-    if patient_id and os.path.isdir(os.path.join(PATIENTS_DIR, str(patient_id))):
-        return str(patient_id), get_patient_folder(str(patient_id)), False
+        if patient_id and os.path.isdir(os.path.join(PATIENTS_DIR, str(patient_id))):
+            return str(patient_id), get_patient_folder(str(patient_id)), False
 
-    patient_id = _find_existing_patient(req_key)
-    created = patient_id is None
-    if created:
-        patient_id = get_next_patient_id()
+        patient_id = _find_existing_patient(req_key)
+        created = patient_id is None
+        if created:
+            patient_id = get_next_patient_id()
 
-    index[req_key] = patient_id
-    _write_json(PATIENT_INDEX_FILE, index)
-    return patient_id, get_patient_folder(patient_id), created
+        index[req_key] = patient_id
+        _write_json(PATIENT_INDEX_FILE, index)
+        return patient_id, get_patient_folder(patient_id), created
 
 
 def get_next_patient_id() -> str:
-    counter_file = "counter.txt"
+    counter_file = os.path.join(PATIENTS_DIR, "counter.txt")
+    legacy_counter = "counter.txt"
+    if not os.path.exists(counter_file) and os.path.exists(legacy_counter):
+        with open(legacy_counter, "r") as legacy:
+            os.makedirs(PATIENTS_DIR, exist_ok=True)
+            with open(counter_file, "w") as current:
+                current.write(legacy.read().strip() or "0")
     if not os.path.exists(counter_file):
         with open(counter_file, "w") as f:
             f.write("0")
@@ -185,33 +205,22 @@ def update_patient_records(
 
 # ── Token ───────────────────────────────────
 async def get_token() -> str:
-    global _cached_token, _token_expires_at
+    return await get_prokerala_token(PROKERALA_CLIENT_ID, PROKERALA_CLIENT_SECRET)
 
-    if _cached_token and time.time() < _token_expires_at:
-        return _cached_token
 
-    async with httpx.AsyncClient() as client:
-        r = await client.post(
-            "https://api.prokerala.com/token",
-            data={
-                "grant_type":    "client_credentials",
-                "client_id":     PROKERALA_CLIENT_ID,
-                "client_secret": PROKERALA_CLIENT_SECRET,
-            }
-        )
+def _owner_patient_key(owner_id: str, birth_key: str) -> str:
+    import hashlib
+    if not owner_id:
+        return birth_key
+    return hashlib.sha256(f"{owner_id}|{birth_key}".encode("utf-8")).hexdigest()
 
-    if r.status_code != 200:
-        if r.status_code == 401:
-            raise Exception(f"[Error] Prokerala Auth failed: 401 (Unauthorized). "
-                            f"Please check your PROKERALA_CLIENT_ID and PROKERALA_CLIENT_SECRET in config.py. "
-                            f"Original error: {r.text}")
-        raise Exception(f"Auth failed: {r.status_code} — {r.text}")
 
-    d = r.json()
-    _cached_token     = d["access_token"]
-    _token_expires_at = time.time() + d["expires_in"] - 300  # refresh 5 min early
-    print("[OK] Token fetched")
-    return _cached_token
+def _birth_lock(birth_key: str) -> asyncio.Lock:
+    lock = _birth_locks.get(birth_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _birth_locks[birth_key] = lock
+    return lock
 
 
 # ── Timezone ────────────────────────────────
@@ -238,7 +247,8 @@ async def fetch_and_save(
     place: str,
     gender: str = "Unknown",
     father_name: str = "",
-    mother_name: str = ""
+    mother_name: str = "",
+    owner_id: str = "",
 ) -> dict:
     """
     Fetches chart from Prokerala API.
@@ -258,9 +268,11 @@ async def fetch_and_save(
     dt_iso     = f"{dob}T{birth_time}:00{tz_offset}"
     coords     = f"{lat},{lng}"
 
-    # Step 0: Check Master Cache Folder
-    req_key = get_request_key(name, dob, birth_time, lat, lng)
-    cached = get_cached_data(req_key)
+    # Birth key addresses the shared API cache. Patient folders are scoped to the
+    # application user so two accounts cannot share a patient directory.
+    birth_key = get_request_key(name, dob, birth_time, lat, lng)
+    req_key = _owner_patient_key(owner_id, birth_key)
+    cached = get_cached_data(birth_key)
     
     patient_id, folder, created = get_or_create_patient(req_key)
     profile = {
@@ -276,11 +288,11 @@ async def fetch_and_save(
     }
 
     if cached:
-        print(f"\n[Local Cache] Master data found for {name} (Key: {req_key[:8]})")
-        print(f"              Reusing API responses from {CACHE_DIR}/")
+        print("\n[Local Cache] Reusing stored chart responses")
         raw_chart = cached["raw_chart"]
         raw_dasha = cached["raw_dasha"]
         raw_chart["patient_id"] = patient_id
+        raw_chart["chart_key"] = req_key
         raw_dasha["patient_id"] = patient_id
         raw_chart.update({
             "name": name,
@@ -317,61 +329,49 @@ async def fetch_and_save(
             "source": "Local Cache"
         }
 
-    print(f"\n[Prokerala API] Fetching fresh data for {name}...")
-    token      = await get_token()
+    print("\n[Prokerala API] Fetching fresh chart data")
+    async with _birth_lock(birth_key):
+        cached = get_cached_data(birth_key)
+        if cached:
+            raw_chart = cached["raw_chart"]
+            raw_dasha = cached["raw_dasha"]
+            raw_chart["patient_id"] = patient_id
+            raw_chart["chart_key"] = req_key
+            raw_dasha["patient_id"] = patient_id
+            raw_chart.update({
+                "name": name,
+                "gender": gender,
+                "dob": dob,
+                "birth_time": birth_time,
+                "place": place,
+                "lat": lat,
+                "lng": lng,
+            })
+            with open(f"{folder}/raw_chart.json", "w") as f: json.dump(raw_chart, f, indent=2)
+            with open(f"{folder}/raw_dasha.json", "w") as f: json.dump(raw_dasha, f, indent=2)
+            update_patient_records(folder, patient_id, req_key, profile, "Local Cache", created)
+            from jataka_logic import build_chart_dict
+            chart_data = build_chart_dict(raw_chart, raw_dasha)
+            return {
+                "patient_id": patient_id,
+                "folder": folder,
+                "planets": chart_data["planets"],
+                "houses": chart_data["houses"],
+                "ascendant": chart_data["ascendant"],
+                "svg_raw": chart_data["svg_raw"],
+                "dasha_raw": chart_data["dasha_raw"],
+                "source": "Local Cache",
+            }
 
-    async with httpx.AsyncClient(
-            timeout=30.0) as client:
-
-        # Call 1: Planet positions
-        r1 = await client.get(
-            "https://api.prokerala.com"
-            "/v2/astrology/planet-position",
-            headers={"Authorization":
-                     f"Bearer {token}"},
-            params={"ayanamsa": 1,
-                    "coordinates": coords,
-                    "datetime": dt_iso,
-                    "la": "en"}
-        )
-
-        # Call 2: SVG Chart
-        r2 = await client.get(
-            "https://api.prokerala.com"
-            "/v2/astrology/chart",
-            headers={"Authorization":
-                     f"Bearer {token}"},
-            params={"ayanamsa": 1,
-                    "coordinates": coords,
-                    "datetime": dt_iso,
-                    "chart_type": "rasi",
-                    "chart_style": "south-indian",
-                    "la": "en"}
-        )
-
-        # Call 3: Birth details
-        r3 = await client.get(
-            "https://api.prokerala.com"
-            "/v2/astrology/birth-details",
-            headers={"Authorization":
-                     f"Bearer {token}"},
-            params={"ayanamsa": 1,
-                    "coordinates": coords,
-                    "datetime": dt_iso,
-                    "la": "en"}
-        )
-
-        # Call 4: Dasha periods
-        r4 = await client.get(
-            "https://api.prokerala.com"
-            "/v2/astrology/dasha-periods",
-            headers={"Authorization":
-                     f"Bearer {token}"},
-            params={"ayanamsa": 1,
-                    "coordinates": coords,
-                    "datetime": dt_iso,
-                    "la": "en"}
-        )
+        token = await get_token()
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            common = {"ayanamsa": 1, "coordinates": coords, "datetime": dt_iso, "la": "en"}
+            # These four endpoints return different payloads. Planet position does not
+            # include the chart SVG, birth nakshatra details, or Vimshottari periods.
+            r1 = await prokerala_get(client, "https://api.prokerala.com/v2/astrology/planet-position", token, common)
+            r2 = await prokerala_get(client, "https://api.prokerala.com/v2/astrology/chart", token, {**common, "chart_type": "rasi", "chart_style": "south-indian"})
+            r3 = await prokerala_get(client, "https://api.prokerala.com/v2/astrology/birth-details", token, common)
+            r4 = await prokerala_get(client, "https://api.prokerala.com/v2/astrology/dasha-periods", token, common)
 
     # Save raw chart data
     raw_chart = {
@@ -384,9 +384,10 @@ async def fetch_and_save(
         "lat":         lat,
         "lng":         lng,
         "fetched_at":  datetime.now().isoformat(),
-        "planet_position": r1.json() if r1.status_code == 200 else (print(f"[Error] Planet API error: {r1.status_code} - {r1.text[:200]}") or {}),
-        "chart_svg":   r2.text if r2.status_code == 200 else (print(f"[Error] Chart API error: {r2.status_code} - {r2.text[:200]}") or ""),
-        "birth_details": r3.json() if r3.status_code == 200 else (print(f"[Error] Birth details error: {r3.status_code} - {r3.text[:200]}") or {}),
+        "chart_key": req_key,
+        "planet_position": r1.json() if r1.status_code == 200 else {},
+        "chart_svg":   r2.text if r2.status_code == 200 else "",
+        "birth_details": r3.json() if r3.status_code == 200 else {},
     }
 
     # Save raw dasha data
@@ -405,10 +406,11 @@ async def fetch_and_save(
     )
 
     if is_valid:
-        save_to_master_cache(req_key, raw_chart, raw_dasha)
-        print(f"✅ Master Cache updated for {name}")
+        cache_chart = {key: value for key, value in raw_chart.items() if key not in {"name", "place", "gender"}}
+        save_to_master_cache(birth_key, cache_chart, raw_dasha)
+        print("[OK] Master cache updated")
     else:
-        print(f"⚠️ Data incomplete or restricted. Skipping Master Cache for {name}")
+        print("[Warning] Chart data incomplete. Master cache was not updated")
 
     with open(f"{folder}/raw_chart.json", "w") as f:
         json.dump(raw_chart, f, indent=2)
