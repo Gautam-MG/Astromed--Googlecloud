@@ -897,9 +897,60 @@ def _build_latest_patient_payload(patient_id: str) -> dict:
 @app.route("/generate-chart", methods=["POST"])
 @require_auth(rate_limit="chart")
 def generate_chart():
+    """
+    Generate a complete astrology chart.
+
+    Debugging:
+    - Logs every major processing step.
+    - Logs the patient_id once available.
+    - Logs API/data-source information.
+    - Logs completion of each major calculation.
+    - Uses log.exception() so the full traceback is preserved.
+    - Does NOT log API secrets or sensitive authentication credentials.
+    """
+    request_id = getattr(g, "request_id", "")
+
     try:
+        # ============================================================
+        # STEP 0 — Receive and validate request
+        # ============================================================
+        log.info(
+            "chart_step_00_request_received",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+            },
+        )
+
         body = request.get_json(force=True)
+
+        log.info(
+            "chart_step_01_request_json_parsed",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "body_type": type(body).__name__,
+                "body_keys": list(body.keys()) if isinstance(body, dict) else [],
+            },
+        )
+
         chart_input = parse_chart_input(body)
+
+        log.info(
+            "chart_step_02_chart_input_parsed",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "name_present": bool(chart_input.get("name")),
+                "dob": chart_input.get("dob"),
+                "birth_time": chart_input.get("birth_time"),
+                "birth_place": chart_input.get("birth_place"),
+                "lat": chart_input.get("lat"),
+                "lng": chart_input.get("lng"),
+                "gender": chart_input.get("gender"),
+            },
+        )
+
         name = chart_input["name"]
         dob = chart_input["dob"]
         birth_time = chart_input["birth_time"]
@@ -912,35 +963,221 @@ def generate_chart():
 
         log.info(
             "chart_requested",
-            extra={"request_id": getattr(g, "request_id", ""), "internal_user_id": g.user["internal_user_id"], "operation": "generate_chart"},
+            extra={
+                "request_id": request_id,
+                "internal_user_id": g.user["internal_user_id"],
+                "operation": "generate_chart",
+            },
         )
 
-        # Step 1: Fetch and save raw data
-        fetch_result = asyncio.run(fetch_and_save(
-            name       = name,
-            dob        = dob,
-            birth_time = birth_time,
-            lat        = lat,
-            lng        = lng,
-            place      = birth_place,
-            gender     = gender,
-            father_name = father_name,
-            mother_name = mother_name,
-            owner_id   = g.user["internal_user_id"],
-        ))
+        # ============================================================
+        # STEP 1 — Fetch and save raw Prokerala data
+        # ============================================================
+        log.info(
+            "chart_step_03_fetch_and_save_started",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "dob": dob,
+                "birth_time": birth_time,
+                "lat": lat,
+                "lng": lng,
+            },
+        )
+
+        fetch_result = asyncio.run(
+            fetch_and_save(
+                name=name,
+                dob=dob,
+                birth_time=birth_time,
+                lat=lat,
+                lng=lng,
+                place=birth_place,
+                gender=gender,
+                father_name=father_name,
+                mother_name=mother_name,
+                owner_id=g.user["internal_user_id"],
+            )
+        )
+
+        log.info(
+            "chart_step_04_fetch_and_save_completed",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "fetch_result_type": type(fetch_result).__name__,
+                "fetch_result_keys": (
+                    list(fetch_result.keys())
+                    if isinstance(fetch_result, dict)
+                    else []
+                ),
+            },
+        )
+
+        if not fetch_result:
+            log.error(
+                "chart_step_04_fetch_and_save_empty",
+                extra={
+                    "request_id": request_id,
+                    "operation": "generate_chart",
+                },
+            )
+            raise RuntimeError("fetch_and_save returned an empty result")
 
         patient_id = fetch_result["patient_id"]
-        source     = fetch_result.get("source", "Unknown")
+        source = fetch_result.get("source", "Unknown")
+
+        log.info(
+            "chart_step_05_patient_created",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "patient_id": patient_id,
+                "source": source,
+                "has_planets": bool(fetch_result.get("planets")),
+                "planet_count": len(fetch_result.get("planets", []) or []),
+                "has_houses": bool(fetch_result.get("houses")),
+                "house_count": len(fetch_result.get("houses", []) or []),
+                "has_ascendant": bool(fetch_result.get("ascendant")),
+                "has_svg": bool(fetch_result.get("svg_raw")),
+            },
+        )
+
         print(f"Data Source: {source}")
         print(f"Patient ID: {patient_id}")
 
-        # Step 2: Run logic processing
+        # ============================================================
+        # STEP 2 — Run logic processing
+        # ============================================================
+        log.info(
+            "chart_step_06_run_logic_started",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "patient_id": patient_id,
+            },
+        )
+
         processed = run_logic(patient_id)
 
-        # Step 3: Run disease diagnosis
+        log.info(
+            "chart_step_07_run_logic_completed",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "patient_id": patient_id,
+                "processed_type": type(processed).__name__,
+                "processed_keys": (
+                    list(processed.keys())
+                    if isinstance(processed, dict)
+                    else []
+                ),
+                "has_rule1": bool(
+                    processed.get("rule1")
+                    if isinstance(processed, dict)
+                    else False
+                ),
+                "has_dasha": bool(
+                    processed.get("dasha")
+                    if isinstance(processed, dict)
+                    else False
+                ),
+                "has_complete_analysis": bool(
+                    processed.get("complete_analysis")
+                    if isinstance(processed, dict)
+                    else False
+                ),
+            },
+        )
+
+        if not processed:
+            raise RuntimeError("run_logic returned an empty result")
+
+        # ============================================================
+        # STEP 3 — Run disease diagnosis
+        # ============================================================
+        log.info(
+            "chart_step_08_run_diagnose_started",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "patient_id": patient_id,
+            },
+        )
+
         diagnosis = run_diagnose(patient_id)
 
-        current_planetary_positions = asyncio.run(fetch_current_planetary_positions(lat, lng))
+        log.info(
+            "chart_step_09_run_diagnose_completed",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "patient_id": patient_id,
+                "diagnosis_type": type(diagnosis).__name__,
+                "diagnosis_present": bool(diagnosis),
+            },
+        )
+
+        # ============================================================
+        # STEP 4 — Fetch current planetary positions
+        # ============================================================
+        log.info(
+            "chart_step_10_current_planets_started",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "patient_id": patient_id,
+                "lat": lat,
+                "lng": lng,
+            },
+        )
+
+        current_planetary_positions = asyncio.run(
+            fetch_current_planetary_positions(lat, lng)
+        )
+
+        log.info(
+            "chart_step_11_current_planets_completed",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "patient_id": patient_id,
+                "has_result": bool(current_planetary_positions),
+                "result_keys": (
+                    list(current_planetary_positions.keys())
+                    if isinstance(current_planetary_positions, dict)
+                    else []
+                ),
+                "planet_count": len(
+                    current_planetary_positions.get("planets", []) or []
+                )
+                if isinstance(current_planetary_positions, dict)
+                else 0,
+                "timezone": (
+                    current_planetary_positions.get("timezone")
+                    if isinstance(current_planetary_positions, dict)
+                    else None
+                ),
+                "as_of_local": (
+                    current_planetary_positions.get("as_of_local")
+                    if isinstance(current_planetary_positions, dict)
+                    else None
+                ),
+            },
+        )
+
+        # ============================================================
+        # STEP 5 — Calculate second ascendant
+        # ============================================================
+        log.info(
+            "chart_step_12_second_ascendant_started",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "patient_id": patient_id,
+            },
+        )
+
         second_ascendant = calculate_second_ascendant(
             dob=dob,
             birth_time=birth_time,
@@ -949,14 +1186,100 @@ def generate_chart():
             planets=fetch_result["planets"],
             houses=fetch_result["houses"],
         )
-        # Step 4: Run zone analysis
-        zone_analysis = run_zone_analysis(fetch_result, second_ascendant)
+
+        log.info(
+            "chart_step_13_second_ascendant_completed",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "patient_id": patient_id,
+                "result_type": type(second_ascendant).__name__,
+                "result_keys": (
+                    list(second_ascendant.keys())
+                    if isinstance(second_ascendant, dict)
+                    else []
+                ),
+            },
+        )
+
+        # ============================================================
+        # STEP 6 — Run zone analysis
+        # ============================================================
+        log.info(
+            "chart_step_14_zone_analysis_started",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "patient_id": patient_id,
+            },
+        )
+
+        zone_analysis = run_zone_analysis(
+            fetch_result,
+            second_ascendant,
+        )
+
+        log.info(
+            "chart_step_15_zone_analysis_completed",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "patient_id": patient_id,
+                "result_type": type(zone_analysis).__name__,
+                "result_keys": (
+                    list(zone_analysis.keys())
+                    if isinstance(zone_analysis, dict)
+                    else []
+                ),
+            },
+        )
+
+        # ============================================================
+        # STEP 7 — Build important Rashi distance analysis
+        # ============================================================
+        log.info(
+            "chart_step_16_imp_rashi_distance_started",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "patient_id": patient_id,
+            },
+        )
+
         imp_rashi_distance = build_imp_rashi_distance_analysis(
             fetch_result,
             processed["rule1"],
             current_planetary_positions,
             processed["dasha"],
         )
+
+        log.info(
+            "chart_step_17_imp_rashi_distance_completed",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "patient_id": patient_id,
+                "result_type": type(imp_rashi_distance).__name__,
+                "result_keys": (
+                    list(imp_rashi_distance.keys())
+                    if isinstance(imp_rashi_distance, dict)
+                    else []
+                ),
+            },
+        )
+
+        # ============================================================
+        # STEP 8 — Build birth/current distance analysis
+        # ============================================================
+        log.info(
+            "chart_step_18_birth_current_distance_started",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "patient_id": patient_id,
+            },
+        )
+
         birth_current_distance = build_birth_current_distance_analysis(
             fetch_result,
             processed["rule1"],
@@ -964,34 +1287,163 @@ def generate_chart():
             processed["dasha"],
         )
 
+        log.info(
+            "chart_step_19_birth_current_distance_completed",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "patient_id": patient_id,
+                "result_type": type(birth_current_distance).__name__,
+                "result_keys": (
+                    list(birth_current_distance.keys())
+                    if isinstance(birth_current_distance, dict)
+                    else []
+                ),
+            },
+        )
+
+        # ============================================================
+        # STEP 9 — Disease filter
+        # ============================================================
+        log.info(
+            "chart_step_20_disease_filter_started",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "patient_id": patient_id,
+                "gender": gender,
+            },
+        )
+
         from rules import apply_disease_filter
-        disease_filter = apply_disease_filter(processed["rule1"], processed["dasha"], gender=gender)
 
+        disease_filter = apply_disease_filter(
+            processed["rule1"],
+            processed["dasha"],
+            gender=gender,
+        )
+
+        log.info(
+            "chart_step_21_disease_filter_completed",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "patient_id": patient_id,
+                "result_type": type(disease_filter).__name__,
+                "result_keys": (
+                    list(disease_filter.keys())
+                    if isinstance(disease_filter, dict)
+                    else []
+                ),
+            },
+        )
+
+        # ============================================================
+        # STEP 10 — Save chart_data.json
+        # ============================================================
         chart_data_path = f"patients/{patient_id}/chart_data.json"
-        with open(chart_data_path, "w") as f:
-            _json.dump({
-                **fetch_result,
-                "rule1":           processed["rule1"],
-                "dasha":           processed["dasha"],
-                "complete":        processed["complete_analysis"],
-                "disease_filter":  disease_filter,
-                "rashi_correlation": processed.get("rashi_correlation", {}),
-                "organ_truth_correlation": processed.get("organ_truth_correlation", {}),
-                "dasha_chat_priority": processed.get("dasha_chat_priority", {}),
-                "zone_analysis":   zone_analysis,
-                "current_planetary_positions": current_planetary_positions,
-                "second_ascendant": second_ascendant,
-                "imp_rashi_distance": imp_rashi_distance,
-                "birth_current_distance": birth_current_distance,
-            }, f, indent=2)
 
+        log.info(
+            "chart_step_22_chart_data_save_started",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "patient_id": patient_id,
+                "path": chart_data_path,
+            },
+        )
+
+        with open(chart_data_path, "w") as f:
+            _json.dump(
+                {
+                    **fetch_result,
+                    "rule1": processed["rule1"],
+                    "dasha": processed["dasha"],
+                    "complete": processed["complete_analysis"],
+                    "disease_filter": disease_filter,
+                    "rashi_correlation": processed.get(
+                        "rashi_correlation",
+                        {},
+                    ),
+                    "organ_truth_correlation": processed.get(
+                        "organ_truth_correlation",
+                        {},
+                    ),
+                    "dasha_chat_priority": processed.get(
+                        "dasha_chat_priority",
+                        {},
+                    ),
+                    "zone_analysis": zone_analysis,
+                    "current_planetary_positions": current_planetary_positions,
+                    "second_ascendant": second_ascendant,
+                    "imp_rashi_distance": imp_rashi_distance,
+                    "birth_current_distance": birth_current_distance,
+                },
+                f,
+                indent=2,
+            )
+
+        log.info(
+            "chart_step_23_chart_data_save_completed",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "patient_id": patient_id,
+                "path": chart_data_path,
+            },
+        )
+
+        # ============================================================
+        # STEP 11 — Load processed_logic.json
+        # ============================================================
         processed_file = f"patients/{patient_id}/processed_logic.json"
+
+        log.info(
+            "chart_step_24_processed_file_read_started",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "patient_id": patient_id,
+                "path": processed_file,
+            },
+        )
+
         with open(processed_file, "r") as f:
             proc_dict = _json.load(f)
 
-        # --- Diagnostic Logic moved to rules.py ---
-        most_probable = processed["complete_analysis"].get("most_probable", [])
-        
+        log.info(
+            "chart_step_25_processed_file_read_completed",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "patient_id": patient_id,
+                "processed_file_keys": (
+                    list(proc_dict.keys())
+                    if isinstance(proc_dict, dict)
+                    else []
+                ),
+            },
+        )
+
+        # ============================================================
+        # STEP 12 — Diagnostic logic / mappings
+        # ============================================================
+        log.info(
+            "chart_step_26_diagnostic_mapping_started",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "patient_id": patient_id,
+            },
+        )
+
+        most_probable = (
+            processed["complete_analysis"].get(
+                "most_probable",
+                [],
+            )
+        )
+
         proc_dict["disease_filter"] = disease_filter
         proc_dict["most_probable"] = most_probable
         proc_dict["gender"] = gender
@@ -1003,68 +1455,231 @@ def generate_chart():
         with open(processed_file, "w") as f:
             _json.dump(proc_dict, f, indent=2)
 
-        # Build mappings for legacy UI components if needed
+        log.info(
+            "chart_step_27_processed_file_save_completed",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "patient_id": patient_id,
+                "most_probable_count": len(most_probable or []),
+            },
+        )
+
+        # ============================================================
+        # STEP 13 — Build legacy UI mappings
+        # ============================================================
+        log.info(
+            "chart_step_28_legacy_mappings_started",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "patient_id": patient_id,
+            },
+        )
+
         rule1_result = processed["rule1"]
+
         nakshatra_diseases = {}
         planet_diseases = {}
+
         rk_planets = (
-            rule1_result.get("rogkaraka_1", []) +
-            ([rule1_result["rogkaraka_2"]] if rule1_result.get("rogkaraka_2") else []) +
-            ([rule1_result["rogkaraka_3"]] if rule1_result.get("rogkaraka_3") else [])
+            rule1_result.get("rogkaraka_1", [])
+            + (
+                [rule1_result["rogkaraka_2"]]
+                if rule1_result.get("rogkaraka_2")
+                else []
+            )
+            + (
+                [rule1_result["rogkaraka_3"]]
+                if rule1_result.get("rogkaraka_3")
+                else []
+            )
         )
-        conditional_moon = rule1_result.get("conditional_moon") or {}
-        if conditional_moon.get("include") and (conditional_moon.get("planet") or {}).get("name") == "Moon":
-            rk_planets.append(conditional_moon["planet"])
+
+        conditional_moon = (
+            rule1_result.get("conditional_moon")
+            or {}
+        )
+
+        if (
+            conditional_moon.get("include")
+            and (conditional_moon.get("planet") or {}).get("name")
+            == "Moon"
+        ):
+            rk_planets.append(
+                conditional_moon["planet"]
+            )
+
+        log.info(
+            "chart_step_29_rk_planets_resolved",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "patient_id": patient_id,
+                "rk_planet_count": len(rk_planets),
+                "rk_planets": [
+                    p.get("name")
+                    for p in rk_planets
+                    if isinstance(p, dict)
+                ],
+            },
+        )
+
         for p in rk_planets:
             if p.get("name"):
-                nakshatra_diseases[p["name"]] = filter_terms_by_gender(
-                    get_nakshatra_diseases(p.get("nakshatra"), p.get("nakshatra_pada")),
-                    gender,
-                )
-                diseases = PLANET_DISEASES.get(p["name"], [])
-                planet_diseases[p["name"]] = filter_terms_by_gender(diseases, gender)
+                planet_name = p["name"]
 
-        # Step 4: Build response exactly as before
+                log.info(
+                    "chart_step_30_processing_rk_planet",
+                    extra={
+                        "request_id": request_id,
+                        "operation": "generate_chart",
+                        "patient_id": patient_id,
+                        "planet": planet_name,
+                        "nakshatra": p.get("nakshatra"),
+                        "nakshatra_pada": p.get("nakshatra_pada"),
+                    },
+                )
+
+                nakshatra_diseases[planet_name] = (
+                    filter_terms_by_gender(
+                        get_nakshatra_diseases(
+                            p.get("nakshatra"),
+                            p.get("nakshatra_pada"),
+                        ),
+                        gender,
+                    )
+                )
+
+                diseases = PLANET_DISEASES.get(
+                    planet_name,
+                    [],
+                )
+
+                planet_diseases[planet_name] = (
+                    filter_terms_by_gender(
+                        diseases,
+                        gender,
+                    )
+                )
+
+        log.info(
+            "chart_step_31_legacy_mappings_completed",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "patient_id": patient_id,
+                "nakshatra_disease_planets": len(
+                    nakshatra_diseases
+                ),
+                "planet_disease_planets": len(
+                    planet_diseases
+                ),
+            },
+        )
+
+        # ============================================================
+        # STEP 14 — Build final response payload
+        # ============================================================
+        log.info(
+            "chart_step_32_payload_build_started",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "patient_id": patient_id,
+            },
+        )
+
         payload = {
-            "success":           True,
-            "name":              name,
-            "dob":               dob,
-            "birth_time":        birth_time,
-            "birth_place":       birth_place,
-            "father_name":       father_name,
-            "mother_name":       mother_name,
-            "gender":            gender,
-            "lat":               lat,
-            "lng":               lng,
-            "patient_id":        patient_id,
-            "ascendant":         fetch_result["ascendant"],
-            "planets":           fetch_result["planets"],
-            "houses":            fetch_result["houses"],
-            "svg_raw":           fetch_result["svg_raw"],
-            "rule1":             processed["rule1"],
-            "dasha":             processed["dasha"],
+            "success": True,
+            "name": name,
+            "dob": dob,
+            "birth_time": birth_time,
+            "birth_place": birth_place,
+            "father_name": father_name,
+            "mother_name": mother_name,
+            "gender": gender,
+            "lat": lat,
+            "lng": lng,
+            "patient_id": patient_id,
+            "ascendant": fetch_result["ascendant"],
+            "planets": fetch_result["planets"],
+            "houses": fetch_result["houses"],
+            "svg_raw": fetch_result["svg_raw"],
+            "rule1": processed["rule1"],
+            "dasha": processed["dasha"],
             "complete_analysis": processed["complete_analysis"],
-            "disease_filter":    disease_filter,
-            "hitlist":           processed.get("hitlist", {}),
-            "rashi_correlation": processed.get("rashi_correlation", {}),
-            "organ_truth_correlation": processed.get("organ_truth_correlation", {}),
-            "dasha_chat_priority": processed.get("dasha_chat_priority", {}),
+            "disease_filter": disease_filter,
+            "hitlist": processed.get("hitlist", {}),
+            "rashi_correlation": processed.get(
+                "rashi_correlation",
+                {},
+            ),
+            "organ_truth_correlation": processed.get(
+                "organ_truth_correlation",
+                {},
+            ),
+            "dasha_chat_priority": processed.get(
+                "dasha_chat_priority",
+                {},
+            ),
             "nakshatra_diseases": nakshatra_diseases,
-            "planet_diseases":   planet_diseases,
-            "kb_planet_diseases": filter_planet_diseases_by_gender(PLANET_DISEASES, gender),
-            "kb_nakshatra_diseases": filter_nakshatra_diseases_by_gender(NAKSHATRA_DISEASES, gender),
-            "kb_rashi_organs": filter_rashi_organs_by_gender(RASHI_ORGANS, gender),
-            "most_probable":     most_probable,
-            "top_diseases":      processed["complete_analysis"].get("top_diseases", []),
-            "diagnosis":         diagnosis,
-            "zone_analysis":     zone_analysis,
+            "planet_diseases": planet_diseases,
+            "kb_planet_diseases": filter_planet_diseases_by_gender(
+                PLANET_DISEASES,
+                gender,
+            ),
+            "kb_nakshatra_diseases": filter_nakshatra_diseases_by_gender(
+                NAKSHATRA_DISEASES,
+                gender,
+            ),
+            "kb_rashi_organs": filter_rashi_organs_by_gender(
+                RASHI_ORGANS,
+                gender,
+            ),
+            "most_probable": most_probable,
+            "top_diseases": processed[
+                "complete_analysis"
+            ].get(
+                "top_diseases",
+                [],
+            ),
+            "diagnosis": diagnosis,
+            "zone_analysis": zone_analysis,
             "current_planetary_positions": current_planetary_positions,
-            "second_ascendant":  second_ascendant,
+            "second_ascendant": second_ascendant,
             "imp_rashi_distance": imp_rashi_distance,
             "birth_current_distance": birth_current_distance,
-            "health_forecast":   processed.get("health_forecast", []),
-            "data_source":       source,
+            "health_forecast": processed.get(
+                "health_forecast",
+                [],
+            ),
+            "data_source": source,
         }
+
+        log.info(
+            "chart_step_33_payload_build_completed",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "patient_id": patient_id,
+                "payload_keys": list(payload.keys()),
+            },
+        )
+
+        # ============================================================
+        # STEP 15 — Save generation lineage
+        # ============================================================
+        log.info(
+            "chart_step_34_persistence_started",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "patient_id": patient_id,
+                "source": source,
+            },
+        )
+
         lineage = get_services().persistence.save_generation(
             g.user["internal_user_id"],
             chart_input,
@@ -1072,14 +1687,80 @@ def generate_chart():
             source,
             payload,
         )
+
+        log.info(
+            "chart_step_35_persistence_completed",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "patient_id": patient_id,
+                "lineage_type": type(lineage).__name__,
+                "lineage_keys": (
+                    list(lineage.keys())
+                    if isinstance(lineage, dict)
+                    else []
+                ),
+            },
+        )
+
         payload["input_id"] = lineage["input_id"]
+
+        # ============================================================
+        # STEP 16 — SUCCESS
+        # ============================================================
+        log.info(
+            "chart_generation_completed",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "patient_id": patient_id,
+                "source": source,
+            },
+        )
+
         return jsonify(payload)
 
-    except (RequestValidationError, UpstreamError, AuthorizationError, HTTPException):
+    except (
+        RequestValidationError,
+        UpstreamError,
+        AuthorizationError,
+        HTTPException,
+    ):
+        # These are known/handled exceptions.
+        #
+        # Still log them with traceback because they are useful for
+        # debugging upstream/API/request failures.
+        log.exception(
+            "chart_generation_known_exception",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+            },
+        )
         raise
-    except Exception:
-        log.error("chart_failed", extra={"request_id": getattr(g, "request_id", ""), "operation": "generate_chart"})
+
+    except Exception as exc:
+        # ============================================================
+        # FINAL CATCH-ALL
+        # ============================================================
+        #
+        # IMPORTANT:
+        # log.exception() automatically includes the current exception
+        # traceback. This is what you need to identify the exact failing
+        # line in Docker logs.
+        #
+        log.exception(
+            "chart_failed",
+            extra={
+                "request_id": request_id,
+                "operation": "generate_chart",
+                "exception_type": type(exc).__name__,
+                "exception_message": str(exc),
+            },
+        )
+
         return safe_failure()
+
 
 
 
