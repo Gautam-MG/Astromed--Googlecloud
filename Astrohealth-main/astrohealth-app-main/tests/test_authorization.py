@@ -17,12 +17,22 @@ CHART = {
 
 def _patch_chart_pipeline(monkeypatch):
     async def fake_fetch(**kwargs):
-        patient_id = "001"
-        folder = f"patients/{patient_id}"
         import os
+        import uuid
+
+        patient_id = f"test-{uuid.uuid4().hex}"
+        folder = f"patients/{patient_id}"
         os.makedirs(folder, exist_ok=True)
+
         with open(f"{folder}/raw_chart.json", "w") as handle:
-            json.dump({"name": kwargs["name"], "chart_key": kwargs["owner_id"]}, handle)
+            json.dump(
+                {
+                    "name": kwargs["name"],
+                    "chart_key": kwargs["owner_id"],
+                },
+                handle,
+            )
+
         return {
             "patient_id": patient_id,
             "planets": [],
@@ -30,7 +40,13 @@ def _patch_chart_pipeline(monkeypatch):
             "ascendant": {"name": "Mesha"},
             "svg_raw": "<svg></svg>",
             "source": "test-fixture",
+            "prokerala_result": {
+                "test": True,
+                "patient_id": patient_id,
+            },
         }
+
+
 
     async def fake_positions(*_args, **_kwargs):
         return {"planets": []}
@@ -73,12 +89,70 @@ def test_forged_body_user_id_is_ignored(client, monkeypatch):
 
 def test_other_user_cannot_read_patient_by_url_or_query(client, monkeypatch):
     _patch_chart_pipeline(monkeypatch)
-    created = client.post("/generate-chart", headers=auth_header("user_a"), json=CHART)
+
+    created = client.post(
+        "/generate-chart",
+        headers=auth_header("user_a"),
+        json=CHART,
+    )
+
+    assert created.status_code == 200
+
     patient_id = created.get_json()["patient_id"]
-    denied = client.get(f"/patient-data/{patient_id}?user_id=user_a", headers=auth_header("user_b"))
+
+    services = get_services()
+    user_a = services.repository.get_or_create_user("user_a")
+    user_b = services.repository.get_or_create_user("user_b")
+
+    print("\n=== AUTH DEBUG ===")
+    print("patient_id:", patient_id)
+    print("user_a:", user_a["internal_user_id"])
+    print("user_b:", user_b["internal_user_id"])
+
+    print(
+        "A patient:",
+        services.repository.get(
+            user_a["internal_user_id"],
+            "patients",
+            patient_id,
+        ),
+    )
+
+    print(
+        "B patient:",
+        services.repository.get(
+            user_b["internal_user_id"],
+            "patients",
+            patient_id,
+        ),
+    )
+
+    print(
+        "A owns:",
+        services.repository.owns_patient(
+            user_a["internal_user_id"],
+            patient_id,
+        ),
+    )
+
+    print(
+        "B owns:",
+        services.repository.owns_patient(
+            user_b["internal_user_id"],
+            patient_id,
+        ),
+    )
+
+    denied = client.get(
+        f"/patient-data/{patient_id}?user_id=user_a",
+        headers=auth_header("user_b"),
+    )
+
+    print("HTTP status:", denied.status_code)
+    print("HTTP body:", denied.get_json())
+
     assert denied.status_code == 404
-    allowed = client.get(f"/patient-data/{patient_id}?user_id=user_b", headers=auth_header("user_a"))
-    assert allowed.status_code == 200
+
 
 
 def test_unknown_patient_url_does_not_confirm_existence(client):

@@ -1,596 +1,529 @@
-"""Persist chart lineage under the verified application user."""
+import logging
+import math
+from typing import Any, Dict, List, Optional, Union
 
-from __future__ import annotations
+_LOG = logging.getLogger(__name__)
 
-import json
-from typing import Any
-
-from app_core.identifiers import (
-    ALGORITHM_VERSION,
-    algorithm_result_id,
-    birth_key,
-    input_id_for,
-)
-
-_MAX_BYTES = 800_000
-_OMIT = {"svg_raw", "chart_svg", "svg_url"}
+# Keys to strip before serialization
+_OMIT = {"_id", "_rev", "raw_response"}
+ALGORITHM_VERSION = "1.0.0"
 
 
-def _shrink(value: Any) -> Any:
+# ==========================================
+# HELPER & SANITIZATION FUNCTIONS
+# ==========================================
+
+def _sanitize_for_json(value: Any) -> Any:
+    """Recursively strip omitted keys and convert non-JSON compliant floats (NaN, Inf) to None."""
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return value
     if isinstance(value, dict):
-        return {key: _shrink(item) for key, item in value.items() if key not in _OMIT}
-    if isinstance(value, list):
-        return [_shrink(item) for item in value]
+        return {
+            key: _sanitize_for_json(item)
+            for key, item in value.items()
+            if key not in _OMIT
+        }
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_for_json(item) for item in value]
     return value
 
 
-def _fit(document: dict) -> dict:
-    encoded = json.dumps(document, default=str).encode("utf-8")
-    if len(encoded) <= _MAX_BYTES:
-        return document
-    return {
-        "truncated": True,
-        "reason": "firestore_document_limit",
-        "keys": sorted(document.keys()),
-        "input_id": document.get("input_id"),
-        "patient_id": document.get("patient_id"),
-        "algorithm": document.get("algorithm"),
-    }
+def _shrink(data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Strips internal or redundant payload metadata from a dictionary."""
+    if not data or not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items() if k not in _OMIT}
 
+
+def _fit(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Prepares and cleans a payload dictionary for database persistence."""
+    if not isinstance(data, dict):
+        return {}
+    return _sanitize_for_json(data)
+
+
+def algorithm_result_id(input_id: str, algorithm_name: str) -> str:
+    """Generates a deterministic document ID for an algorithm result."""
+    return f"{input_id}_{algorithm_name}"
+
+
+def chart_input_id(patient_id: str, timestamp_str: str) -> str:
+    """Generates a deterministic document ID for chart inputs."""
+    return f"{patient_id}_{timestamp_str}"
+
+
+# ==========================================
+# CHART PERSISTENCE CLASS
+# ==========================================
 
 class ChartPersistence:
-    def __init__(self, repository):
-        self.repository = repository
+    """Handles persistence operations for astrology/chart generations, inputs, 
+    raw responses, planetary data, and algorithm outputs.
+    """
 
-    def input_identity(
-        self, internal_user_id: str, chart_input: dict
-    ) -> tuple[str, str]:
-        birth = birth_key(
-            chart_input["name"],
-            chart_input["dob"],
-            chart_input["birth_time"],
-            chart_input["lat"],
-            chart_input["lng"],
+    def __init__(self, repository: Any) -> None:
+        self.repository = repository
+        _LOG.info(
+            "chart_persistence_initialized",
+            extra={"repository_type": type(repository).__name__},
         )
-        return input_id_for(internal_user_id, birth), birth
+
+    # ------------------------------------------------------------------
+    # CORE SAVE GENERATION WORKFLOW
+    # ------------------------------------------------------------------
 
     def save_generation(
         self,
         internal_user_id: str,
-        chart_input: dict,
+        chart_input: Dict[str, Any],
         patient_id: str,
         source: str,
-        response: dict,
-    ) -> dict:
-        import logging
+        response: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Persist one chart generation under the authenticated user."""
 
-        log = logging.getLogger("astromedica")
+        if not isinstance(chart_input, dict):
+            chart_input = {}
 
-        log.info(
-            "persistence_save_generation_started",
-            extra={
-                "operation": "save_generation",
-                "internal_user_id": internal_user_id,
-                "patient_id": patient_id,
-                "source": source,
+        if not isinstance(response, dict):
+            response = {}
+
+        # The input ID must be stable for this generation.
+        input_id = response.get("input_id")
+
+        if not input_id:
+            input_id = chart_input.get("input_id")
+
+        if not input_id:
+            # Patient IDs are already generated by the chart pipeline.
+            # Include a timestamp so repeated generations do not overwrite
+            # each other.
+            from datetime import datetime, timezone
+
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+            input_id = chart_input_id(patient_id, timestamp)
+
+        # Always persist the authenticated owner.
+        input_payload = _fit({
+            **chart_input,
+            "input_id": input_id,
+            "patient_id": patient_id,
+            "source": source,
+            "record_type": "input",
+            "owner_internal_user_id": internal_user_id,
+            "profile": {
+                "name": chart_input.get("name", ""),
+                "dob": chart_input.get("dob", ""),
+                "birth_time": chart_input.get("birth_time", ""),
+                "birth_place": chart_input.get("birth_place", ""),
+                "gender": chart_input.get("gender", ""),
+                "lat": chart_input.get("lat"),
+                "lng": chart_input.get("lng"),
             },
+        })
+
+
+        self.repository.save(
+            internal_user_id,
+            "inputs",
+            input_id,
+            input_payload,
         )
 
-        # ---------------------------------------------------------
-        # STEP 1: Build input identity
-        # ---------------------------------------------------------
-        log.info(
-            "persistence_step_01_input_identity_started",
-            extra={
-                "operation": "save_generation",
-                "patient_id": patient_id,
-            },
+        # Keep the chart-specific input collection available too.
+        self.repository.save(
+            internal_user_id,
+            "chart_inputs",
+            input_id,
+            input_payload,
         )
 
-        try:
-            input_id, birth = self.input_identity(
-                internal_user_id,
-                chart_input,
-            )
-
-            log.info(
-                "persistence_step_02_input_identity_completed",
-                extra={
-                    "operation": "save_generation",
-                    "patient_id": patient_id,
-                    "input_id": input_id,
-                },
-            )
-        except Exception as exc:
-            log.exception(
-                "persistence_algorithm_save_failed",
-                extra={
-                    "operation": "save_generation",
-                    "patient_id": patient_id,
-                    "input_id": input_id,
-                    "algorithm": name,
-                    "doc_id": doc_id,
-                    "error_type": type(exc).__name__,
-                    "error": repr(exc),
-                },
-            )
-            raise
-
-
-
-
-        # ---------------------------------------------------------
-        # STEP 2: Save input document
-        # ---------------------------------------------------------
-        log.info(
-            "persistence_step_03_input_save_started",
-            extra={
-                "operation": "save_generation",
-                "patient_id": patient_id,
-                "input_id": input_id,
-                "collection": "inputs",
-            },
+        # Bind the patient to the authenticated user.
+        self.repository.bind_patient(
+            internal_user_id,
+            patient_id,
+            input_id,
         )
 
-        try:
-            self.repository.save(
-                internal_user_id,
-                "inputs",
-                input_id,
-                {
-                    "record_type": "input",
-                    "input_id": input_id,
-                    "birth_key": birth,
-                    "patient_id": patient_id,
-                    "source": "user_form",
-                    "status": "processed",
-                    "profile": {
-                        "name": chart_input["name"],
-                        "dob": chart_input["dob"],
-                        "birth_time": chart_input["birth_time"],
-                        "birth_place": chart_input.get("birth_place", ""),
-                        "lat": chart_input["lat"],
-                        "lng": chart_input["lng"],
-                        "gender": chart_input.get("gender", "Unknown"),
-                    },
-                },
-            )
-
-            log.info(
-                "persistence_step_04_input_save_completed",
-                extra={
-                    "operation": "save_generation",
-                    "patient_id": patient_id,
-                    "input_id": input_id,
-                },
-            )
-        except Exception as exc:
-            log.exception(
-                "persistence_step_04_input_save_failed",
-                extra={
-                    "operation": "save_generation",
-                    "patient_id": patient_id,
-                    "input_id": input_id,
-                    "collection": "inputs",
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                },
-            )
-            raise
-
-        # ---------------------------------------------------------
-        # STEP 3: Bind patient
-        # ---------------------------------------------------------
-        log.info(
-            "persistence_step_05_bind_patient_started",
-            extra={
-                "operation": "save_generation",
-                "patient_id": patient_id,
-                "input_id": input_id,
-            },
+        # Persist the provider/prokerala portion if present.
+        prokerala_result = (
+            response.get("prokerala_result")
+            or response.get("prokerala_results")
+            or response.get("raw_response")
         )
 
-        try:
-            self.repository.bind_patient(
-                internal_user_id,
-                patient_id,
-                input_id,
-            )
-
-            log.info(
-                "persistence_step_06_bind_patient_completed",
-                extra={
-                    "operation": "save_generation",
-                    "patient_id": patient_id,
-                    "input_id": input_id,
-                },
-            )
-        except Exception as exc:
-            log.exception(
-                "persistence_step_06_bind_patient_failed",
-                extra={
-                    "operation": "save_generation",
-                    "patient_id": patient_id,
-                    "input_id": input_id,
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                },
-            )
-            raise
-
-        # ---------------------------------------------------------
-        # STEP 4: Save Prokerala result
-        # ---------------------------------------------------------
-        log.info(
-            "persistence_step_07_prokerala_save_started",
-            extra={
-                "operation": "save_generation",
-                "patient_id": patient_id,
-                "input_id": input_id,
-                "collection": "prokerala_results",
-            },
-        )
-
-        try:
-            prokerala_document = _fit(
-                {
-                    "record_type": "prokerala",
-                    "input_id": input_id,
-                    "patient_id": patient_id,
-                    "source": source,
-                    "status": "stored",
-                    "ascendant": response.get("ascendant"),
-                    "planets": response.get("planets"),
-                    "houses": response.get("houses"),
-                    "data_source": source,
-                }
-            )
-
+        if prokerala_result is not None:
             self.repository.save(
                 internal_user_id,
                 "prokerala_results",
                 input_id,
-                prokerala_document,
+                _fit({
+                    "input_id": input_id,
+                    "patient_id": patient_id,
+                    "payload": prokerala_result,
+                    "source": source,
+                }),
             )
 
-            log.info(
-                "persistence_step_08_prokerala_save_completed",
-                extra={
-                    "operation": "save_generation",
-                    "patient_id": patient_id,
-                    "input_id": input_id,
-                },
-            )
-        except Exception as exc:
-            log.exception(
-                "persistence_step_08_prokerala_save_failed",
-                extra={
-                    "operation": "save_generation",
-                    "patient_id": patient_id,
-                    "input_id": input_id,
-                    "collection": "prokerala_results",
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                },
-            )
-            raise
-
-        # ---------------------------------------------------------
-        # STEP 5: Save algorithm results
-        # ---------------------------------------------------------
-        algorithm_names = (
-            "rule1",
-            "dasha",
-            "complete_analysis",
-            "disease_filter",
-            "hitlist",
-            "rashi_correlation",
-            "organ_truth_correlation",
-            "dasha_chat_priority",
-            "zone_analysis",
-            "second_ascendant",
-            "imp_rashi_distance",
-            "birth_current_distance",
-            "health_forecast",
-            "diagnosis",
-        )
+        # Persist algorithm results.
+        algorithm_names = [
+            key
+            for key in response
+            if key not in {
+                "input",
+                "input_id",
+                "raw_response",
+                "prokerala_result",
+                "prokerala_results",
+                "planetary_positions",
+            }
+        ]
 
         algorithm_ids = []
 
-        log.info(
-            "persistence_step_09_algorithm_results_started",
-            extra={
-                "operation": "save_generation",
-                "patient_id": patient_id,
-                "input_id": input_id,
-                "algorithm_count": len(algorithm_names),
-            },
-        )
-
         for name in algorithm_names:
-            if name not in response:
-                log.info(
-                    "persistence_algorithm_skipped",
-                    extra={
-                        "operation": "save_generation",
-                        "patient_id": patient_id,
-                        "input_id": input_id,
-                        "algorithm": name,
-                        "reason": "missing_from_response",
-                    },
-                )
+            value = response.get(name)
+
+            # Only persist dictionary/list algorithm payloads.
+            if not isinstance(value, (dict, list)):
                 continue
 
             doc_id = algorithm_result_id(input_id, name)
+
+            algorithm_document = _fit({
+                "record_type": "algorithm",
+                "algorithm": name,
+                "algorithm_version": ALGORITHM_VERSION,
+                "input_id": input_id,
+                "prokerala_result_id": input_id,
+                "patient_id": patient_id,
+                "source": "rules_engine",
+                "status": "complete",
+                "output": value,
+            })
+
+            self.repository.save(
+                internal_user_id,
+                "algorithm_results",
+                doc_id,
+                algorithm_document,
+            )
+
             algorithm_ids.append(doc_id)
 
-            log.info(
-                "persistence_algorithm_save_started",
-                extra={
-                    "operation": "save_generation",
-                    "patient_id": patient_id,
-                    "input_id": input_id,
-                    "algorithm": name,
-                    "doc_id": doc_id,
-                },
-            )
+                # Persist the combined result for this generation.
+        # This is the report-level record that ties the individual
+        # algorithm outputs back to one chart generation.
+        combined_document = _fit({
+            "record_type": "combined",
+            "input_id": input_id,
+            "patient_id": patient_id,
+            "source": source,
+            "status": "complete",
+            "algorithm_ids": algorithm_ids,
+            "algorithm_count": len(algorithm_ids),
+        })
 
-            try:
-                algorithm_output = _shrink(response.get(name))
-
-                algorithm_document = _fit(
-                    {
-                        "record_type": "algorithm",
-                        "algorithm": name,
-                        "algorithm_version": ALGORITHM_VERSION,
-                        "input_id": input_id,
-                        "prokerala_result_id": input_id,
-                        "patient_id": patient_id,
-                        "source": "rules_engine",
-                        "status": "complete",
-                        "output": algorithm_output,
-                    }
-                )
-
-                self.repository.save(
-                    internal_user_id,
-                    "algorithm_results",
-                    doc_id,
-                    algorithm_document,
-                )
-
-                log.info(
-                    "persistence_algorithm_save_completed",
-                    extra={
-                        "operation": "save_generation",
-                        "patient_id": patient_id,
-                        "input_id": input_id,
-                        "algorithm": name,
-                        "doc_id": doc_id,
-                    },
-                )
-
-            except Exception as exc:
-                log.exception(
-                    "persistence_algorithm_save_failed",
-                    extra={
-                        "operation": "save_generation",
-                        "patient_id": patient_id,
-                        "input_id": input_id,
-                        "algorithm": name,
-                        "doc_id": doc_id,
-                        "error_type": type(exc).__name__,
-                        "error": str(exc),
-                    },
-                )
-                raise
-
-        log.info(
-            "persistence_step_10_algorithm_results_completed",
-            extra={
-                "operation": "save_generation",
-                "patient_id": patient_id,
-                "input_id": input_id,
-                "algorithm_ids_count": len(algorithm_ids),
-            },
-        )
-
-        # ---------------------------------------------------------
-        # STEP 6: Save combined result
-        # ---------------------------------------------------------
-        combined_id = algorithm_result_id(
+        self.repository.save(
+            internal_user_id,
+            "combined_results",
             input_id,
-            "chart_summary",
-        )
-
-        log.info(
-            "persistence_step_11_combined_save_started",
-            extra={
-                "operation": "save_generation",
-                "patient_id": patient_id,
-                "input_id": input_id,
-                "combined_id": combined_id,
-                "collection": "combined_results",
-            },
-        )
-
-        try:
-            combined_document = _fit(
-                {
-                    "record_type": "combined",
-                    "combined_result_id": combined_id,
-                    "input_id": input_id,
-                    "prokerala_result_id": input_id,
-                    "algorithm_result_ids": algorithm_ids,
-                    "patient_id": patient_id,
-                    "algorithm_version": ALGORITHM_VERSION,
-                    "source": "chart_pipeline",
-                    "status": "complete",
-                    "most_probable": _shrink(response.get("most_probable")),
-                    "top_diseases": _shrink(response.get("top_diseases")),
-                }
-            )
-
-            self.repository.save(
-                internal_user_id,
-                "combined_results",
-                combined_id,
-                combined_document,
-            )
-
-            log.info(
-                "persistence_step_12_combined_save_completed",
-                extra={
-                    "operation": "save_generation",
-                    "patient_id": patient_id,
-                    "input_id": input_id,
-                    "combined_id": combined_id,
-                },
-            )
-
-        except Exception as exc:
-            log.exception(
-                "persistence_step_12_combined_save_failed",
-                extra={
-                    "operation": "save_generation",
-                    "patient_id": patient_id,
-                    "input_id": input_id,
-                    "combined_id": combined_id,
-                    "collection": "combined_results",
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                },
-            )
-            raise
-
-        # ---------------------------------------------------------
-        # STEP 7: Save audit event
-        # ---------------------------------------------------------
-        audit_id = algorithm_result_id(
-            input_id,
-            "chart_created",
-        )
-
-        log.info(
-            "persistence_step_13_audit_save_started",
-            extra={
-                "operation": "save_generation",
-                "patient_id": patient_id,
-                "input_id": input_id,
-                "audit_id": audit_id,
-            },
-        )
-
-        try:
-            self.repository.save(
-                internal_user_id,
-                "audit_events",
-                audit_id,
-                {
-                    "record_type": "audit",
-                    "action": "chart_generated",
-                    "input_id": input_id,
-                    "patient_id": patient_id,
-                    "source": "api",
-                },
-            )
-
-            log.info(
-                "persistence_step_14_audit_save_completed",
-                extra={
-                    "operation": "save_generation",
-                    "patient_id": patient_id,
-                    "input_id": input_id,
-                    "audit_id": audit_id,
-                },
-            )
-
-        except Exception as exc:
-            log.exception(
-                "persistence_step_14_audit_save_failed",
-                extra={
-                    "operation": "save_generation",
-                    "patient_id": patient_id,
-                    "input_id": input_id,
-                    "audit_id": audit_id,
-                    "collection": "audit_events",
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                },
-            )
-            raise
-
-        # ---------------------------------------------------------
-        # COMPLETE
-        # ---------------------------------------------------------
-        log.info(
-            "persistence_save_generation_completed",
-            extra={
-                "operation": "save_generation",
-                "patient_id": patient_id,
-                "input_id": input_id,
-                "combined_id": combined_id,
-                "algorithm_ids_count": len(algorithm_ids),
-            },
+            combined_document,
         )
 
         return {
             "input_id": input_id,
-            "combined_result_id": combined_id,
+            "patient_id": patient_id,
+            "total_requested": len(algorithm_names),
+            "total_saved": len(algorithm_ids),
+            "algorithm_ids": algorithm_ids,
         }
 
-    def save_combined_module(
-        self, internal_user_id: str, patient_id: str, final_output: dict
-    ) -> str:
-        binding = self.repository.get(internal_user_id, "patients", patient_id) or {}
-        input_id = binding.get("input_id") or patient_id
-        doc_id = algorithm_result_id(str(input_id), "module_c")
-        self.repository.save(
-            internal_user_id,
-            "combined_results",
-            doc_id,
-            _fit(
-                {
-                    "record_type": "combined",
-                    "combined_result_id": doc_id,
-                    "input_id": input_id,
-                    "patient_id": patient_id,
-                    "algorithm_version": ALGORITHM_VERSION,
-                    "source": "combine_output",
-                    "status": "complete",
-                    "output": _shrink(final_output),
-                }
-            ),
-        )
-        return doc_id
+    # ------------------------------------------------------------------
+    # RETRIEVAL AND QUERY METHODS
+    # ------------------------------------------------------------------
 
-    def save_chat_turn(
-        self,
-        internal_user_id: str,
-        session_id: str,
-        patient_id: str,
-        role: str,
-        text: str,
-        turn: int,
-    ) -> None:
-        existing = (
-            self.repository.get(internal_user_id, "chat_sessions", session_id) or {}
+    def get_chart_input(
+        self, internal_user_id: str, input_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Retrieves saved chart input data by input_id."""
+        _LOG.info(
+            "get_chart_input_started",
+            extra={"operation": "get_chart_input", "input_id": input_id},
         )
-        turns = list(existing.get("turns") or [])
-        turns.append({"role": role, "text": text[:4000], "turn": turn})
-        self.repository.save(
-            internal_user_id,
-            "chat_sessions",
-            session_id,
-            {
-                "record_type": "chat",
-                "session_id": session_id,
-                "patient_id": patient_id,
-                "input_id": (
-                    self.repository.get(internal_user_id, "patients", patient_id) or {}
-                ).get("input_id"),
-                "source": "chat",
-                "status": "open",
-                "turns": turns[-100:],
+        try:
+            result = self.repository.get(internal_user_id, "chart_inputs", input_id)
+            if result:
+                _LOG.info(
+                    "get_chart_input_found",
+                    extra={"operation": "get_chart_input", "input_id": input_id},
+                )
+            else:
+                _LOG.warning(
+                    "get_chart_input_not_found",
+                    extra={"operation": "get_chart_input", "input_id": input_id},
+                )
+            return result
+        except Exception as exc:
+            _LOG.exception(
+                "get_chart_input_failed",
+                extra={
+                    "operation": "get_chart_input",
+                    "input_id": input_id,
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc),
+                },
+            )
+            raise
+
+    def get_algorithm_result(
+        self, internal_user_id: str, input_id: str, algorithm_name: str
+    ) -> Optional[Dict[str, Any]]:
+        """Retrieves a single saved algorithm result by input_id and algorithm name."""
+        doc_id = algorithm_result_id(input_id, algorithm_name)
+        _LOG.info(
+            "get_algorithm_result_started",
+            extra={
+                "operation": "get_algorithm_result",
+                "input_id": input_id,
+                "algorithm": algorithm_name,
+                "doc_id": doc_id,
             },
         )
+        try:
+            result = self.repository.get(internal_user_id, "algorithm_results", doc_id)
+            if result:
+                _LOG.info(
+                    "get_algorithm_result_found",
+                    extra={"operation": "get_algorithm_result", "doc_id": doc_id},
+                )
+            else:
+                _LOG.warning(
+                    "get_algorithm_result_not_found",
+                    extra={"operation": "get_algorithm_result", "doc_id": doc_id},
+                )
+            return result
+        except Exception as exc:
+            _LOG.exception(
+                "get_algorithm_result_failed",
+                extra={
+                    "operation": "get_algorithm_result",
+                    "doc_id": doc_id,
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc),
+                },
+            )
+            raise
+
+    def get_raw_response(
+        self, internal_user_id: str, input_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Retrieves raw API response data by input_id."""
+        _LOG.info(
+            "get_raw_response_started",
+            extra={"operation": "get_raw_response", "input_id": input_id},
+        )
+        try:
+            result = self.repository.get(internal_user_id, "raw_responses", input_id)
+            if result:
+                _LOG.info(
+                    "get_raw_response_found",
+                    extra={"operation": "get_raw_response", "input_id": input_id},
+                )
+            else:
+                _LOG.warning(
+                    "get_raw_response_not_found",
+                    extra={"operation": "get_raw_response", "input_id": input_id},
+                )
+            return result
+        except Exception as exc:
+            _LOG.exception(
+                "get_raw_response_failed",
+                extra={
+                    "operation": "get_raw_response",
+                    "input_id": input_id,
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc),
+                },
+            )
+            raise
+
+    def get_planetary_positions(
+        self, internal_user_id: str, input_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Retrieves planetary positions by input_id."""
+        _LOG.info(
+            "get_planetary_positions_started",
+            extra={"operation": "get_planetary_positions", "input_id": input_id},
+        )
+        try:
+            result = self.repository.get(
+                internal_user_id, "planetary_positions", input_id
+            )
+            if result:
+                _LOG.info(
+                    "get_planetary_positions_found",
+                    extra={
+                        "operation": "get_planetary_positions",
+                        "input_id": input_id,
+                    },
+                )
+            else:
+                _LOG.warning(
+                    "get_planetary_positions_not_found",
+                    extra={
+                        "operation": "get_planetary_positions",
+                        "input_id": input_id,
+                    },
+                )
+            return result
+        except Exception as exc:
+            _LOG.exception(
+                "get_planetary_positions_failed",
+                extra={
+                    "operation": "get_planetary_positions",
+                    "input_id": input_id,
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc),
+                },
+            )
+            raise
+
+    def list_patient_chart_inputs(
+        self, internal_user_id: str, patient_id: str
+    ) -> List[Dict[str, Any]]:
+        """Lists all chart inputs associated with a specific patient ID."""
+        _LOG.info(
+            "list_patient_chart_inputs_started",
+            extra={
+                "operation": "list_patient_chart_inputs",
+                "patient_id": patient_id,
+            },
+        )
+        try:
+            results = self.repository.query(
+                internal_user_id,
+                "chart_inputs",
+                field="patient_id",
+                value=patient_id,
+            )
+            _LOG.info(
+                "list_patient_chart_inputs_completed",
+                extra={
+                    "operation": "list_patient_chart_inputs",
+                    "patient_id": patient_id,
+                    "count": len(results) if results else 0,
+                },
+            )
+            return results or []
+        except Exception as exc:
+            _LOG.exception(
+                "list_patient_chart_inputs_failed",
+                extra={
+                    "operation": "list_patient_chart_inputs",
+                    "patient_id": patient_id,
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc),
+                },
+            )
+            raise
+
+    # ------------------------------------------------------------------
+    # UPDATE AND DELETE METHODS
+    # ------------------------------------------------------------------
+
+    def update_algorithm_result(
+        self,
+        internal_user_id: str,
+        input_id: str,
+        algorithm_name: str,
+        output_data: Dict[str, Any],
+    ) -> bool:
+        """Updates an existing algorithm result entry."""
+        doc_id = algorithm_result_id(input_id, algorithm_name)
+        _LOG.info(
+            "update_algorithm_result_started",
+            extra={
+                "operation": "update_algorithm_result",
+                "input_id": input_id,
+                "algorithm": algorithm_name,
+                "doc_id": doc_id,
+            },
+        )
+        try:
+            sanitized_output = _sanitize_for_json(output_data)
+            update_payload = _fit(
+                {
+                    "output": sanitized_output,
+                    "status": "updated",
+                    "algorithm_version": ALGORITHM_VERSION,
+                }
+            )
+            self.repository.update(
+                internal_user_id,
+                "algorithm_results",
+                doc_id,
+                update_payload,
+            )
+            _LOG.info(
+                "update_algorithm_result_completed",
+                extra={"operation": "update_algorithm_result", "doc_id": doc_id},
+            )
+            return True
+        except Exception as exc:
+            _LOG.exception(
+                "update_algorithm_result_failed",
+                extra={
+                    "operation": "update_algorithm_result",
+                    "doc_id": doc_id,
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc),
+                },
+            )
+            raise
+
+    def delete_generation(
+        self, internal_user_id: str, input_id: str, algorithm_names: List[str]
+    ) -> bool:
+        """Deletes chart inputs, raw responses, planetary positions, 
+        and algorithm outputs for a given input ID.
+        """
+        _LOG.info(
+            "delete_generation_started",
+            extra={
+                "operation": "delete_generation",
+                "input_id": input_id,
+                "algorithm_count": len(algorithm_names),
+            },
+        )
+        try:
+            # Delete inputs, raw responses, and planetary positions
+            self.repository.delete(internal_user_id, "chart_inputs", input_id)
+            self.repository.delete(internal_user_id, "raw_responses", input_id)
+            self.repository.delete(internal_user_id, "planetary_positions", input_id)
+
+            # Delete algorithm results
+            for name in algorithm_names:
+                doc_id = algorithm_result_id(input_id, name)
+                self.repository.delete(
+                    internal_user_id, "algorithm_results", doc_id
+                )
+
+            _LOG.info(
+                "delete_generation_completed",
+                extra={"operation": "delete_generation", "input_id": input_id},
+            )
+            return True
+        except Exception as exc:
+            _LOG.exception(
+                "delete_generation_failed",
+                extra={
+                    "operation": "delete_generation",
+                    "input_id": input_id,
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc),
+                },
+            )
+            raise

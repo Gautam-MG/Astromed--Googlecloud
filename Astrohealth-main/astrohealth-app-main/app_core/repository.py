@@ -83,8 +83,14 @@ class MemoryRepository:
             internal_user_id,
             "patients",
             patient_id,
-            {"patient_id": patient_id, "input_id": input_id, "source": "chart"},
+            {
+                "patient_id": patient_id,
+                "input_id": input_id,
+                "source": "chart",
+                "owner_internal_user_id": internal_user_id,
+            },
         )
+
 
     def list_records(self, internal_user_id: str) -> dict:
         with self._lock:
