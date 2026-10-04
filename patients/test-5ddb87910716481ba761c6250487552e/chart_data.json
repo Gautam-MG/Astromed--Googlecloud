@@ -1,0 +1,35 @@
+{
+  "patient_id": "test-5ddb87910716481ba761c6250487552e",
+  "planets": [],
+  "houses": [],
+  "ascendant": {
+    "name": "Mesha"
+  },
+  "svg_raw": "<svg></svg>",
+  "source": "test-fixture",
+  "prokerala_result": {
+    "test": true,
+    "patient_id": "test-5ddb87910716481ba761c6250487552e"
+  },
+  "rule1": {
+    "rogkaraka_1": []
+  },
+  "dasha": {},
+  "complete": {
+    "most_probable": [
+      "Headache"
+    ],
+    "top_diseases": []
+  },
+  "disease_filter": {},
+  "rashi_correlation": {},
+  "organ_truth_correlation": {},
+  "dasha_chat_priority": {},
+  "zone_analysis": {},
+  "current_planetary_positions": {
+    "planets": []
+  },
+  "second_ascendant": {},
+  "imp_rashi_distance": {},
+  "birth_current_distance": {}
+}
