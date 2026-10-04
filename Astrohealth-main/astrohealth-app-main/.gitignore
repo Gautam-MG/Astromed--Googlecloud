@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+
+# Data and Cache
+cache_index.json
+counter.txt
+dasha_test_out.txt
+*.log
+
+# Patient data (sensitive)
+patients/
+charts_cache/
+chart_data.json
+raw_chart.json
+raw_dasha.json
+
+# IDEs
+.vscode/
+.idea/
+.trae/
+
+# OS
+.DS_Store
+Thumbs.db

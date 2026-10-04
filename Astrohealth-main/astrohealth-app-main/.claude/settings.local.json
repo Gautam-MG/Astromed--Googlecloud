@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import server\")",
+      "mcp__Claude_Preview__preview_start",
+      "Bash(curl -s \"/priority6-data/009\")",
+      "Bash(tasklist //FI \"IMAGENAME eq python.exe\")",
+      "Bash(curl -s -v \"/health\")",
+      "Bash(curl -s \"/priority6-data/002\")",
+      "Bash(curl -s \"/priority6-data/004\")",
+      "Bash(curl -s \"/priority6-data/008\")",
+      "Bash(curl -s \"/priority6-data/001\")",
+      "Bash(curl -s \"/priority6-data/005\")",
+      "Bash(curl -s \"/priority6-data/006\")",
+      "Bash(curl -s -i \"/priority6-data/009\")",
+      "Bash(curl -s -v \"/\")",
+      "Bash(tasklist //FI \"PID eq 21176\")",
+      "Bash(python -c \"import disease_priority_cascade_logic_v2\")",
+      "Bash(python -c \"import disease_priority_cascade_logic_v2 as m; print\\('IMPORT OK'\\); print\\(sorted\\(m.GENERIC_ORGANS\\)\\)\")",
+      "Bash(python -c \"import importlib, disease_priority_cascade_logic_v2 as m; importlib.reload\\(m\\); print\\('OK, MIN_SHARED_ORGANS=', m.MIN_SHARED_ORGANS, 'NON_DISEASE_TERMS=', m.NON_DISEASE_TERMS\\)\")",
+      "Bash(python -c \"import importlib, disease_priority_cascade_logic_v2 as m; importlib.reload\\(m\\); print\\('OK'\\)\")",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\\\\n\" \"/results?patient_id=009\")",
+      "Bash(curl -s \"/patient-data/009\")",
+      "Bash(curl -s \"/results?patient_id=009\")",
+      "Bash(node -c server.py)",
+      "Bash(curl -s -o /dev/null -w \"http_code=%{http_code} size=%{size_download}\\\\n\" \"/results?patient_id=009\")"
+    ]
+  }
+}
